@@ -1,20 +1,37 @@
 services:
-  open-webui:
+  jeonbuk-ai:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG-main}
-    container_name: open-webui
+    container_name: jeonbuk-ai
     volumes:
       - open-webui:/app/backend/data
-    ports:
-      - ${OPEN_WEBUI_PORT-3000}:8080
-    environment:
-      - OLLAMA_BASE_URL=
-      - WEBUI_SECRET_KEY=
-    extra_hosts:
-      - host.docker.internal:host-gateway
+    expose:
+      - "8080"
     restart: unless-stopped
+    networks:
+      - customui
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    depends_on:
+      - jeonbuk-ai
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+    networks:
+      - customui
 
 volumes:
   open-webui: {}
+
+networks:
+  customui:
+    driver: bridge
+

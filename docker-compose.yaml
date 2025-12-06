@@ -4,6 +4,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: jeonbuk-ai
+    environment:
+      - DATABASE_URL=postgresql://admin:wjsqnrai@220.124.155.35:5432/customui
+      - CORS_ALLOW_ORIGIN=https://ai.jb.go.kr;http://ai.jb.go.kr
     volumes:
       - open-webui:/app/backend/data
     expose:

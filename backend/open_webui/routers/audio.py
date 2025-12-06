@@ -1,21 +1,31 @@
+from asyncio import streams
 import hashlib
 import json
 import logging
 import os
 import uuid
+import re
+from datetime import datetime
 import html
 import base64
 from functools import lru_cache
-from pydub import AudioSegment
+from pathlib import Path
+from pydub import AudioSegment, effects
 from pydub.silence import split_on_silence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+from transformers import pipeline
+import torch
+from tqdm import tqdm
+import concurrent.futures
+import gc
 
 from fnmatch import fnmatch
 import aiohttp
 import aiofiles
 import requests
 import mimetypes
+from urllib.parse import urljoin, quote
 
 from fastapi import (
     Depends,
@@ -34,7 +44,6 @@ from pydantic import BaseModel
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.headers import include_user_info_headers
 from open_webui.config import (
     WHISPER_MODEL_AUTO_UPDATE,
     WHISPER_MODEL_DIR,
@@ -53,11 +62,19 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
 )
 
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from transformers import pipeline as whisper_pipeline
+
+from io import BytesIO
+from hwpx.document import HwpxDocument
+from hwpx.templates import blank_document_bytes
 
 router = APIRouter()
 
 # Constants
-MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_MB = 25
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
 AZURE_MAX_FILE_SIZE_MB = 200
 AZURE_MAX_FILE_SIZE = AZURE_MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
@@ -82,8 +99,11 @@ from pydub.utils import mediainfo
 def is_audio_conversion_required(file_path):
     """
     Check if the given audio file needs conversion to mp3.
+    백엔드 지원 포맷: flac, m4a, mp3, mp4, mpeg, wav, webm
     """
     SUPPORTED_FORMATS = {"flac", "m4a", "mp3", "mp4", "mpeg", "wav", "webm"}
+    # 추가 코덱 지원 (opus, vorbis는 webm 컨테이너에서 사용)
+    SUPPORTED_CODECS = {"flac", "mp3", "aac", "pcm", "opus", "vorbis"}
 
     if not os.path.isfile(file_path):
         log.error(f"File not found: {file_path}")
@@ -94,28 +114,75 @@ def is_audio_conversion_required(file_path):
         codec_name = info.get("codec_name", "").lower()
         codec_type = info.get("codec_type", "").lower()
         codec_tag_string = info.get("codec_tag_string", "").lower()
+        format_name = info.get("format_name", "").lower()
 
-        if codec_name == "aac" and codec_type == "audio" and codec_tag_string == "mp4a":
-            # File is AAC/mp4a audio, recommend mp3 conversion
+        log.info(f"Audio format detection - File: {os.path.basename(file_path)}, "
+                f"Format: {format_name}, Codec: {codec_name}, Type: {codec_type}")
+
+        # webm, matroska 컨테이너는 항상 변환 (opus 코덱 포함)
+        if any(fmt in format_name for fmt in ["webm", "matroska", "ogg"]):
+            log.info(f"WebM/Matroska/Ogg container detected, conversion required")
             return True
 
-        # If the codec name is in the supported formats
+        # AAC/mp4a는 변환 필요
+        if codec_name == "aac" and codec_type == "audio" and codec_tag_string == "mp4a":
+            log.info(f"AAC/mp4a audio detected, conversion required")
+            return True
+
+        # opus, vorbis 코덱은 항상 변환
+        if codec_name in ["opus", "vorbis"]:
+            log.info(f"Opus/Vorbis codec detected, conversion required")
+            return True
+
+        # 지원되는 포맷이면 변환 불필요
         if codec_name in SUPPORTED_FORMATS:
+            log.info(f"Supported format detected, no conversion needed")
             return False
 
+        # 알 수 없는 포맷은 변환 시도
+        log.warning(f"Unknown format detected, will attempt conversion")
         return True
     except Exception as e:
         log.error(f"Error getting audio format: {e}")
-        return False
+        # 에러 발생 시 안전하게 변환 시도
+        return True
 
 
 def convert_audio_to_mp3(file_path):
-    """Convert audio file to mp3 format."""
+    """
+    Convert audio file to mp3 format with automatic format detection.
+    지원 포맷: webm (opus/vorbis), mp4, m4a, wav, flac, ogg 등
+    """
     try:
         output_path = os.path.splitext(file_path)[0] + ".mp3"
-        audio = AudioSegment.from_file(file_path)
-        audio.export(output_path, format="mp3")
-        log.info(f"Converted {file_path} to {output_path}")
+
+        # pydub가 ffmpeg를 통해 자동으로 포맷 감지하도록 시도
+        try:
+            log.info(f"Attempting automatic format detection for: {file_path}")
+            audio = AudioSegment.from_file(file_path)
+        except Exception as e:
+            log.warning(f"Automatic detection failed: {e}, trying explicit formats")
+
+            # 명시적으로 포맷 지정하여 재시도
+            formats_to_try = ["webm", "mp4", "m4a", "ogg", "wav", "flac"]
+            audio = None
+
+            for fmt in formats_to_try:
+                try:
+                    log.info(f"Trying format: {fmt}")
+                    audio = AudioSegment.from_file(file_path, format=fmt)
+                    log.info(f"Successfully loaded as {fmt}")
+                    break
+                except Exception as fmt_error:
+                    log.debug(f"Format {fmt} failed: {fmt_error}")
+                    continue
+
+            if audio is None:
+                raise Exception("All format attempts failed")
+
+        # MP3로 변환 및 내보내기
+        audio.export(output_path, format="mp3", bitrate="128k")
+        log.info(f"Successfully converted {file_path} to {output_path}")
         return output_path
     except Exception as e:
         log.error(f"Error converting audio file: {e}")
@@ -127,6 +194,11 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
     if model:
         from faster_whisper import WhisperModel
 
+        # 모델 디렉토리가 존재하는지 확인하고 생성
+        if not os.path.exists(WHISPER_MODEL_DIR):
+            os.makedirs(WHISPER_MODEL_DIR, exist_ok=True)
+            log.info(f"Whisper 모델 디렉토리 생성: {WHISPER_MODEL_DIR}")
+
         faster_whisper_kwargs = {
             "model_size_or_path": model,
             "device": DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu",
@@ -136,13 +208,20 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
         }
 
         try:
+            log.info(f"Faster-Whisper 모델 로딩 시도: {model}")
             whisper_model = WhisperModel(**faster_whisper_kwargs)
-        except Exception:
+            log.info(f"Faster-Whisper 모델 로딩 성공: {model}")
+        except Exception as e:
             log.warning(
-                "WhisperModel initialization failed, attempting download with local_files_only=False"
+                f"WhisperModel 초기화 실패 ({model}), local_files_only=False로 재시도: {str(e)}"
             )
             faster_whisper_kwargs["local_files_only"] = False
-            whisper_model = WhisperModel(**faster_whisper_kwargs)
+            try:
+                whisper_model = WhisperModel(**faster_whisper_kwargs)
+                log.info(f"Faster-Whisper 모델 로딩 성공 (재시도): {model}")
+            except Exception as e2:
+                log.error(f"Faster-Whisper 모델 로딩 최종 실패: {str(e2)}")
+                raise
     return whisper_model
 
 
@@ -364,17 +443,23 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                     **(request.app.state.config.TTS_OPENAI_PARAMS or {}),
                 }
 
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {request.app.state.config.TTS_OPENAI_API_KEY}",
-                }
-                if ENABLE_FORWARD_USER_INFO_HEADERS:
-                    headers = include_user_info_headers(headers, user)
-
                 r = await session.post(
                     url=f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/speech",
                     json=payload,
-                    headers=headers,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {request.app.state.config.TTS_OPENAI_API_KEY}",
+                        **(
+                            {
+                                "X-OpenWebUI-User-Name": quote(user.name, safe=" "),
+                                "X-OpenWebUI-User-Id": user.id,
+                                "X-OpenWebUI-User-Email": user.email,
+                                "X-OpenWebUI-User-Role": user.role,
+                            }
+                            if ENABLE_FORWARD_USER_INFO_HEADERS
+                            else {}
+                        ),
+                    },
                     ssl=AIOHTTP_CLIENT_SESSION_SSL,
                 )
 
@@ -563,8 +648,233 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
         return FileResponse(file_path)
 
+def convert_to_wav(input_path):
+    """
+    Convert audio file to WAV format with automatic format detection.
+    지원: webm (opus/vorbis), mp4, m4a, mp3, flac, ogg 등
+    """
+    try:
+        # pydub/ffmpeg 자동 포맷 감지 시도
+        try:
+            log.info(f"WAV 변환 시작 (자동 감지): {input_path}")
+            audio = AudioSegment.from_file(input_path)
+        except Exception as e:
+            log.warning(f"자동 감지 실패: {e}, 명시적 포맷 시도")
 
-def transcription_handler(request, file_path, metadata, user=None):
+            # 파일 확장자 기반 포맷 추출
+            ext = os.path.splitext(input_path)[1].lower().replace('.', '')
+            formats_to_try = [ext] if ext else []
+
+            # 일반적인 포맷들도 시도
+            formats_to_try.extend(["webm", "mp4", "m4a", "ogg", "mp3", "wav", "flac"])
+
+            audio = None
+            for fmt in formats_to_try:
+                try:
+                    log.info(f"WAV 변환 시도 (포맷: {fmt})")
+                    audio = AudioSegment.from_file(input_path, format=fmt)
+                    log.info(f"{fmt} 포맷으로 로드 성공")
+                    break
+                except Exception as fmt_error:
+                    log.debug(f"{fmt} 포맷 실패: {fmt_error}")
+                    continue
+
+            if audio is None:
+                raise Exception("모든 포맷 시도 실패")
+
+        # 정규화 및 WAV로 변환
+        audio = effects.normalize(audio)
+        output_path = os.path.splitext(input_path)[0] + ".wav"
+        audio.export(output_path, format="wav")
+        log.info(f"WAV 변환 완료: {output_path}")
+        return output_path
+    except Exception as e:
+        log.error(f"WAV 변환 실패: {str(e)}")
+        raise
+
+# 무음을 기준으로 오디오 분할 (짧은 청크 병합, 긴 청크 슬라이스)
+# --> 적응형 라이브러리 있어서 변경 예정
+def split_audio(audio_path, min_silence_len=500, silence_thresh=-40, max_chunk_ms=30000, min_chunk_ms=3000):
+    try:
+        audio = AudioSegment.from_wav(audio_path)
+
+        # 무음 기준 분할
+        raw_chunks = split_on_silence(
+            audio,
+            min_silence_len=min_silence_len,
+            silence_thresh=silence_thresh
+        )
+
+        # 너무 짧은 청크 합치기
+        def merge_short_chunks(chunks):
+            merged = []
+            buffer = None
+            for chunk in chunks:
+                if len(chunk) < min_chunk_ms:
+                    if buffer is not None:
+                        buffer += chunk
+                    else:
+                        buffer = chunk
+                else:
+                    if buffer is not None:
+                        chunk = buffer + chunk
+                        buffer = None
+                    merged.append(chunk)
+            if buffer is not None:
+                merged.append(buffer)
+            return merged
+
+        merged_chunks = merge_short_chunks(raw_chunks)
+
+        # 너무 긴 청크는 나누기
+        final_chunks = []
+        for chunk in merged_chunks:
+            if len(chunk) > max_chunk_ms:
+                for i in range(0, len(chunk), max_chunk_ms):
+                    sliced = chunk[i:i + max_chunk_ms]
+                    if len(sliced) >= min_chunk_ms:
+                        final_chunks.append(sliced)
+            else:
+                final_chunks.append(chunk)
+
+        # 분할된 청크 WAV로 저장
+        chunk_paths = []
+        for i, chunk in enumerate(final_chunks):
+            chunk_path = f"{os.path.splitext(audio_path)[0]}_chunk_sil_{i}.wav"
+            chunk.export(chunk_path, format="wav")
+            chunk_paths.append(chunk_path)
+
+        log.info(f"총 {len(chunk_paths)}개의 청크로 분할 완료 (무음 기준 + 병합 + 슬라이스)")
+        return chunk_paths
+
+    except Exception as e:
+        log.error(f"오디오 분할 실패: {str(e)}")
+        raise
+
+# 한 청크 Whisper STT 수행
+def process_chunk(chunk_path, pipe):
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        result = pipe(chunk_path)
+        return result.get('text', '').strip()
+    except Exception as e:
+        log.error(f"청크 처리 실패 ({chunk_path}): {str(e)}")
+        return ""
+
+def convert_seconds_to_hms(seconds):
+    """초를 HH:MM:SS 형식으로 변환 (분 단위로 반올림)"""
+    # 회의록에서는 초 단위까지 필요없으므로 분 단위로 반올림
+    total_seconds = round(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes:02d}:{seconds:02d}"
+
+# 전체 진행 함수
+def transcribe_long_audio(request: Request, file_path, model_name='large-v3'):
+    try:
+        # 오디오 WAV로 변환
+        wav_path = convert_to_wav(file_path)
+
+        # 디바이스 설정 (GPU or CPU)
+        device = 0 if torch.cuda.is_available() else -1
+        log.info(f"Faster-Whisper 실행 중 (Device: {'GPU' if device == 0 else 'CPU'})")
+
+        # Faster-Whisper 모델 로딩
+        log.info("Faster-Whisper 모델 로딩 중...")
+
+        # 설정에서 모델 가져오기 (기본값: large-v3 모델)
+        whisper_model_name = request.app.state.config.WHISPER_MODEL or "large-v3"
+        log.info(f"사용할 모델: {whisper_model_name}")
+
+        # 기존 모델이 있으면 사용, 없으면 새로 생성
+        if request.app.state.faster_whisper_model is None:
+            try:
+                request.app.state.faster_whisper_model = set_faster_whisper_model(
+                    whisper_model_name,
+                    WHISPER_MODEL_AUTO_UPDATE
+                )
+            except Exception as e:
+                log.warning(f"설정된 모델 로딩 실패, 기본 모델로 시도: {str(e)}")
+                # 기본 모델로 재시도
+                request.app.state.faster_whisper_model = set_faster_whisper_model(
+                    "large-v3",
+                    True  # 자동 업데이트 활성화
+                )
+
+        whisper = request.app.state.faster_whisper_model
+
+        if whisper is None:
+            raise RuntimeError("Faster-Whisper 모델을 로드할 수 없습니다.")
+
+        # 회의록에 최적화된 VAD 설정으로 전체 파일 처리
+        log.info("회의록 최적화 설정으로 Faster-Whisper 처리 중...")
+        segments, info = whisper.transcribe(
+            wav_path,
+            beam_size=5,
+            vad_filter=True,  # VAD 활성화
+            vad_parameters=dict(
+                min_silence_duration_ms=1000,  # 5초 무음 (기존 3초→5초, 더 엄격하게)
+                speech_pad_ms=200,             # 0.2초 패딩 (기존 0.5초→0.2초, 더 정확하게)
+                threshold=0.7                  # 0.7 임계값 (기존 0.5→0.7, 더 엄격하게)
+            ),
+            language="ko",
+            # 회의록 품질 향상을 위한 추가 설정
+            condition_on_previous_text=False,  # 이전 텍스트 의존성 제거
+            compression_ratio_threshold=2.4,   # 반복 패턴 감지
+            no_speech_threshold=0.7,          # 무음 구간 더 엄격하게 (기존 0.6→0.7)
+            temperature=0.0,                  # 일관성 있는 출력
+            initial_prompt="이것은 한국어 회의 녹음입니다. 정확하고 자연스러운 문장으로 전사해주세요."
+        )
+
+        log.info(f"언어 감지: {info.language} (확률: {info.language_probability:.2f})")
+
+        # 세그먼트 후처리 및 병합
+        merged_segments = merge_short_segments(segments)
+
+        # 결과 처리
+        results = []
+        segments_list = []
+
+        for segment in merged_segments:
+            text = segment['text']
+            if text and len(text) > 3:  # 3글자 이상만 포함
+                # 반복 패턴 제거
+                text = filter_repetitive_text(text)
+                if text:  # 필터링 후에도 텍스트가 남아있으면
+                    results.append(text)
+                    segments_list.append({
+                        "start": convert_seconds_to_hms(segment['start']),
+                        "end": convert_seconds_to_hms(segment['end']),
+                        "text": text
+                    })
+
+        # 전체 텍스트 통합
+        plain_text = " ".join(results)
+
+        # 향상된 docx 문서 생성
+        doc = create_enhanced_meeting_document(segments_list)
+        hwpx = create_enhanced_meeting_hwpx(segments_list)
+
+        log.info("Faster-Whisper STT 처리 완료")
+        return {
+            'plain_text': plain_text,
+            'docx_document': doc,
+            'hwpx_document': hwpx,
+            'segments': segments_list
+        }
+
+    except Exception as e:
+        log.error(f"Faster-Whisper STT 처리 실패: {str(e)}")
+        raise
+
+def transcription_handler(request, file_path, metadata):
     filename = os.path.basename(file_path)
     file_dir = os.path.dirname(file_path)
     id = filename.split(".")[0]
@@ -594,8 +904,19 @@ def transcription_handler(request, file_path, metadata, user=None):
             % (info.language, info.language_probability)
         )
 
-        transcript = "".join([segment.text for segment in list(segments)])
-        data = {"text": transcript.strip()}
+        # 시간대별 세그먼트 정보를 포함한 데이터 생성
+        segments_list = []
+        for segment in segments:
+            segments_list.append({
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2),
+                "text": segment.text.strip()
+            })
+
+        data = {
+            "text": "".join([segment["text"] for segment in segments_list]),
+            "segments": segments_list
+        }
 
         # save the transcript to a json file
         transcript_file = f"{file_dir}/{id}.json"
@@ -604,6 +925,7 @@ def transcription_handler(request, file_path, metadata, user=None):
 
         log.debug(data)
         return data
+
     elif request.app.state.config.STT_ENGINE == "openai":
         r = None
         try:
@@ -615,15 +937,11 @@ def transcription_handler(request, file_path, metadata, user=None):
                 if language:
                     payload["language"] = language
 
-                headers = {
-                    "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
-                }
-                if user and ENABLE_FORWARD_USER_INFO_HEADERS:
-                    headers = include_user_info_headers(headers, user)
-
                 r = requests.post(
                     url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
-                    headers=headers,
+                    headers={
+                        "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
+                    },
                     files={"file": (filename, open(file_path, "rb"))},
                     data=payload,
                 )
@@ -843,7 +1161,6 @@ def transcription_handler(request, file_path, metadata, user=None):
                 status_code=getattr(r, "status_code", 500) if r else 500,
                 detail=detail if detail else "Open WebUI: Server Connection Error",
             )
-
     elif request.app.state.config.STT_ENGINE == "mistral":
         # Check file exists
         if not os.path.exists(file_path):
@@ -1025,9 +1342,184 @@ def transcription_handler(request, file_path, metadata, user=None):
             )
 
 
-def transcribe(
-    request: Request, file_path: str, metadata: Optional[dict] = None, user=None
-):
+def transcribe(request: Request, file_path: str, metadata: Optional[dict] = None, filedata: list = None):
+    log.info(f"transcribe: {file_path} {metadata}")
+    log.info(f"filedata: {filedata}")
+
+    result = transcribe_long_audio(request, file_path)
+    plain_text = result['plain_text']
+    docx_doc = result['docx_document']
+    hwpx_doc = result['hwpx_document']
+    segments = result['segments']
+    
+    log.info(f"Transcription result length: {len(plain_text)} characters")
+    log.info(f"Number of segments: {len(segments)}")
+
+    try:
+        # 1. 기존 txt 파일 저장 (변경 없음)
+        save_path = os.path.join(os.path.dirname(file_path), f"{os.path.splitext(filedata[1])[0]}.txt")
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(plain_text)
+        log.info(f"Transcript saved to: {save_path}")
+
+        from open_webui.models.files import FileForm, Files
+        from open_webui.storage.provider import Storage
+        import uuid
+
+        # 2. txt 파일을 영구 저장소에 업로드 (변경 없음)
+        txt_id = f"{filedata[0]}txt"
+        txt_name = f"{os.path.splitext(filedata[1])[0]}txt"
+        txt_filename = f"{filedata[2]}txt"
+        with open(save_path, "rb") as f:
+            txt_bytes, txt_storage_path = Storage.upload_file(
+                f, txt_filename,
+                tags = {
+                    **filedata[3],
+                    "OpenWebUI-File-Id": txt_id,
+                    "OpenWebUI-Transcript-Of": f"{filedata[0]}"
+                }
+            )
+
+        user_id = filedata[3]["OpenWebUI-User-Id"]
+        # 3. Files 테이블에 txt 파일 row 생성 (변경 없음)
+        Files.insert_new_file(
+            user_id,
+            FileForm(
+                id = txt_id,
+                filename = txt_name,
+                path = txt_storage_path,
+                meta = {
+                    "name": txt_name,
+                    "content_type": "text/plain",
+                    "size": len(txt_bytes),
+                    "data": {"transcript_of": filedata[0]}
+                },
+            )
+        )
+
+        # 4. docx 파일 저장 및 업로드 (새로 추가)
+        docx_path = os.path.join(os.path.dirname(file_path), f"{os.path.splitext(filedata[1])[0]}.docx")
+        docx_doc.save(docx_path)
+        log.info(f"Detailed transcript saved to: {docx_path}")
+
+        # 5. docx 파일을 영구 저장소에 업로드
+        docx_id = f"{filedata[0]}docx"
+        docx_name = f"{os.path.splitext(filedata[1])[0]}.docx"
+        docx_filename = f"{filedata[2]}.docx"
+        with open(docx_path, "rb") as f:
+            docx_bytes, docx_storage_path = Storage.upload_file(
+                f, docx_filename,
+                tags = {
+                    **filedata[3],
+                    "OpenWebUI-File-Id": docx_id,
+                    "OpenWebUI-Transcript-Of": f"{filedata[0]}",
+                    "OpenWebUI-Transcript-Type": "detailed"
+                }
+            )
+
+        # 6. Files 테이블에 docx 파일 row 생성
+        Files.insert_new_file(
+            user_id,
+            FileForm(
+                id = docx_id,
+                filename = docx_name,
+                path = docx_storage_path,
+                meta = {
+                    "name": docx_name,
+                    "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "size": len(docx_bytes),
+                    "data": {
+                        "transcript_of": filedata[0],
+                        "transcript_type": "detailed",
+                        "segments": segments
+                    }
+                },
+            )
+        )
+        
+        # 4. hwpx 파일 저장 및 업로드 (새로 추가)
+        hwpx_path = os.path.join(os.path.dirname(file_path), f"{os.path.splitext(filedata[1])[0]}.hwpx")
+        log.info(f"=== HWPX 저장 시작 ===")
+        log.info(f"hwpx_doc 타입: {type(hwpx_doc)}")
+        log.info(f"hwpx_doc is None: {hwpx_doc is None}")
+
+        if hwpx_doc is not None:
+            log.info(f"hwpx_doc paragraphs 수: {len(hwpx_doc.paragraphs)}")
+            # dirty 상태 확인
+            for i, sec in enumerate(hwpx_doc.sections):
+                log.info(f"section[{i}] dirty: {sec.dirty}")
+            # serialize 결과 확인
+            updates = hwpx_doc.oxml.serialize()
+            log.info(f"serialize() updates 수: {len(updates)}")
+            for part_name, data in updates.items():
+                log.info(f"  - {part_name}: {len(data)} bytes")
+
+        save_result = hwpx_doc.save(hwpx_path)
+        log.info(f"save() 반환값: {save_result}")
+
+        # 저장된 파일 확인
+        if os.path.exists(hwpx_path):
+            file_size = os.path.getsize(hwpx_path)
+            log.info(f"저장된 hwpx 파일 크기: {file_size} bytes")
+        else:
+            log.error(f"hwpx 파일이 생성되지 않았습니다: {hwpx_path}")
+
+        log.info(f"Detailed transcript saved to: {hwpx_path}")
+
+        # 5. docx 파일을 영구 저장소에 업로드
+        hwpx_id = f"{filedata[0]}hwpx"
+        hwpx_name = f"{os.path.splitext(filedata[1])[0]}.hwpx"
+        hwpx_filename = f"{filedata[2]}.hwpx"
+        with open(hwpx_path, "rb") as f:
+            hwpx_bytes, hwpx_storage_path = Storage.upload_file(
+                f, hwpx_filename,
+                tags = {
+                    **filedata[3],
+                    "OpenWebUI-File-Id": hwpx_id,
+                    "OpenWebUI-Transcript-Of": f"{filedata[0]}",
+                    "OpenWebUI-Transcript-Type": "detailed"
+                }
+            )
+
+        log.info(f"=== HWPX Storage 업로드 완료 ===")
+        log.info(f"hwpx_bytes 크기: {len(hwpx_bytes)} bytes")
+        log.info(f"hwpx_storage_path: {hwpx_storage_path}")
+
+        # 6. Files 테이블에 docx 파일 row 생성
+        Files.insert_new_file(
+            user_id,
+            FileForm(
+                id = hwpx_id,
+                filename = hwpx_name,
+                path = hwpx_storage_path,
+                meta = {
+                    "name": hwpx_name,
+                    "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "size": len(hwpx_bytes),
+                    "data": {
+                        "transcript_of": filedata[0],
+                        "transcript_type": "detailed",
+                        "segments": segments
+                    }
+                },
+            )
+        )
+
+        return {
+            "text": plain_text,
+            "transcript_file_id": txt_id,
+            "detailed_transcript_file_id": docx_id,
+            "detailed_transcript_hwpx_file_id": hwpx_id
+        }
+
+    except Exception as e:
+        log.exception(f"Failed to save or upload transcript: {e}")
+        return {
+            "text": plain_text,
+            "error": f"Transcript saved locally, but upload failed: {str(e)}",
+        }
+
+def transcribe_original(request: Request, file_path: str, metadata: Optional[dict] = None):
     log.info(f"transcribe: {file_path} {metadata}")
 
     if is_audio_conversion_required(file_path):
@@ -1054,9 +1546,7 @@ def transcribe(
         with ThreadPoolExecutor() as executor:
             # Submit tasks for each chunk_path
             futures = [
-                executor.submit(
-                    transcription_handler, request, chunk_path, metadata, user
-                )
+                executor.submit(transcription_handler, request, chunk_path, metadata)
                 for chunk_path in chunk_paths
             ]
             # Gather results as they complete
@@ -1080,69 +1570,51 @@ def transcribe(
     return {
         "text": " ".join([result["text"] for result in results]),
     }
-
-
+    
 def compress_audio(file_path):
+    """
+    Compress audio file with automatic format detection.
+    지원: webm, mp4, m4a, wav, mp3, flac, ogg 등
+    """
     if os.path.getsize(file_path) > MAX_FILE_SIZE:
-        id = os.path.splitext(os.path.basename(file_path))[
-            0
-        ]  # Handles names with multiple dots
+        id = os.path.splitext(os.path.basename(file_path))[0]
         file_dir = os.path.dirname(file_path)
 
-        audio = AudioSegment.from_file(file_path)
-        audio = audio.set_frame_rate(16000).set_channels(1)  # Compress audio
+        # 자동 포맷 감지로 파일 로드
+        try:
+            log.info(f"Compressing audio (auto-detect): {file_path}")
+            audio = AudioSegment.from_file(file_path)
+        except Exception as e:
+            log.warning(f"Auto-detect failed in compress: {e}, trying explicit formats")
 
+            # 파일 확장자 추출
+            ext = os.path.splitext(file_path)[1].lower().replace('.', '')
+            formats_to_try = [ext] if ext else []
+            formats_to_try.extend(["webm", "mp4", "m4a", "ogg", "mp3", "wav", "flac"])
+
+            audio = None
+            for fmt in formats_to_try:
+                try:
+                    log.info(f"Trying compress with format: {fmt}")
+                    audio = AudioSegment.from_file(file_path, format=fmt)
+                    log.info(f"Successfully loaded as {fmt} for compression")
+                    break
+                except Exception as fmt_error:
+                    log.debug(f"Format {fmt} failed in compress: {fmt_error}")
+                    continue
+
+            if audio is None:
+                raise Exception("All format attempts failed in compress_audio")
+
+        # 오디오 압축
+        audio = audio.set_frame_rate(16000).set_channels(1)
         compressed_path = os.path.join(file_dir, f"{id}_compressed.mp3")
         audio.export(compressed_path, format="mp3", bitrate="32k")
-        # log.debug(f"Compressed audio to {compressed_path}")  # Uncomment if log is defined
+        log.info(f"Compressed audio to {compressed_path}")
 
         return compressed_path
     else:
         return file_path
-
-
-def split_audio(file_path, max_bytes, format="mp3", bitrate="32k"):
-    """
-    Splits audio into chunks not exceeding max_bytes.
-    Returns a list of chunk file paths. If audio fits, returns list with original path.
-    """
-    file_size = os.path.getsize(file_path)
-    if file_size <= max_bytes:
-        return [file_path]  # Nothing to split
-
-    audio = AudioSegment.from_file(file_path)
-    duration_ms = len(audio)
-    orig_size = file_size
-
-    approx_chunk_ms = max(int(duration_ms * (max_bytes / orig_size)) - 1000, 1000)
-    chunks = []
-    start = 0
-    i = 0
-
-    base, _ = os.path.splitext(file_path)
-
-    while start < duration_ms:
-        end = min(start + approx_chunk_ms, duration_ms)
-        chunk = audio[start:end]
-        chunk_path = f"{base}_chunk_{i}.{format}"
-        chunk.export(chunk_path, format=format, bitrate=bitrate)
-
-        # Reduce chunk duration if still too large
-        while os.path.getsize(chunk_path) > max_bytes and (end - start) > 5000:
-            end = start + ((end - start) // 2)
-            chunk = audio[start:end]
-            chunk.export(chunk_path, format=format, bitrate=bitrate)
-
-        if os.path.getsize(chunk_path) > max_bytes:
-            os.remove(chunk_path)
-            raise Exception("Audio chunk cannot be reduced below max file size.")
-
-        chunks.append(chunk_path)
-        start = end
-        i += 1
-
-    return chunks
-
 
 @router.post("/transcriptions")
 def transcription(
@@ -1181,6 +1653,18 @@ def transcription(
         file_dir = f"{CACHE_DIR}/audio/transcriptions"
         os.makedirs(file_dir, exist_ok=True)
         file_path = f"{file_dir}/{filename}"
+        
+        # filedata를 구현해야함 -> 이전 버전과 로직이 분리됨
+        unsanitized_filename = file.filename
+        stt_name = os.path.basename(unsanitized_filename)
+        stt_filename = f"{id}_{filename}"
+        tags ={
+                "OpenWebUI-User-Email": user.email,
+                "OpenWebUI-User-Id": user.id,
+                "OpenWebUI-User-Name": user.name,
+                "OpenWebUI-File-Id": id,
+        }
+        filedata = [str(id), stt_name, stt_filename, tags]
 
         with open(file_path, "wb") as f:
             f.write(contents)
@@ -1191,7 +1675,7 @@ def transcription(
             if language:
                 metadata = {"language": language}
 
-            result = transcribe(request, file_path, metadata, user)
+            result = transcribe(request, file_path, metadata, filedata)
 
             return {
                 **result,
@@ -1368,3 +1852,205 @@ async def get_voices(request: Request, user=Depends(get_verified_user)):
             {"id": k, "name": v} for k, v in get_available_voices(request).items()
         ]
     }
+
+def merge_short_segments(segments, min_duration=5.0, max_duration=30.0):
+    """짧은 세그먼트를 의미 있는 단위로 병합"""
+    merged = []
+    current_segment = None
+
+    for segment in segments:
+        duration = segment.end - segment.start
+
+        if current_segment is None:
+            current_segment = {
+                'start': segment.start,
+                'end': segment.end,
+                'text': segment.text.strip()
+            }
+        else:
+            # 현재 세그먼트와 병합할지 결정
+            combined_duration = segment.end - current_segment['start']
+
+            # 병합 조건:
+            # 1. 현재 세그먼트가 너무 짧음 (5초 미만)
+            # 2. 병합해도 최대 길이를 초과하지 않음 (30초 미만)
+            # 3. 세그먼트 간 간격이 3초 미만
+            gap = segment.start - current_segment['end']
+
+            if (duration < min_duration or
+                combined_duration < max_duration and gap < 3.0):
+                # 세그먼트 병합
+                merged_text = current_segment['text'] + " " + segment.text.strip()
+                current_segment = {
+                    'start': current_segment['start'],
+                    'end': segment.end,
+                    'text': merged_text
+                }
+            else:
+                # 현재 세그먼트 저장하고 새로운 세그먼트 시작
+                merged.append(current_segment)
+                current_segment = {
+                    'start': segment.start,
+                    'end': segment.end,
+                    'text': segment.text.strip()
+                }
+
+    # 마지막 세그먼트 추가
+    if current_segment is not None:
+        merged.append(current_segment)
+
+    log.info(f"세그먼트 병합: {len(list(segments))}개 → {len(merged)}개")
+    return merged
+
+
+def filter_repetitive_text(text, max_repeat=2):
+    """반복 패턴 및 의미없는 텍스트 제거"""
+    if not text or not text.strip():
+        return ""
+
+    # 1. 과도한 문자 반복 제거 ("네네네네" → "네")
+    text = re.sub(r'(.)\1{3,}', r'\1', text)
+
+    # 2. 단어 반복 제거 ("그니까 그니까 그니까" → "그니까")
+    words = text.split()
+    filtered_words = []
+
+    for word in words:
+        # 연속된 같은 단어 제거
+        if len(filtered_words) >= max_repeat:
+            recent_words = filtered_words[-max_repeat:]
+            if all(w == word for w in recent_words):
+                continue
+        filtered_words.append(word)
+
+    # 3. 의미없는 추임새나 잡음 제거
+    meaningless_patterns = [
+        r'\b(응+|어+|음+|그+|뭐+)\b',  # "응응응", "어어어" 등
+        r'\b(네+|예+)\s*\b(?=\s*\b(네+|예+)\b)',  # 연속된 "네네네"
+        r'\b\w\b(?=\s*\b\w\b\s*\b\w\b)',  # 연속된 한글자 단어 3개 이상
+    ]
+
+    result_text = " ".join(filtered_words)
+    for pattern in meaningless_patterns:
+        result_text = re.sub(pattern, '', result_text)
+
+    # 4. 공백 정리
+    result_text = re.sub(r'\s+', ' ', result_text).strip()
+
+    return result_text
+
+
+def create_enhanced_meeting_document(segments_list):
+    """향상된 회의록 문서 생성"""
+    doc = Document()
+
+    # 제목 스타일 설정
+    title = doc.add_heading('회의록', 0)
+    title_format = title.runs[0].font
+    title_format.name = '맑은 고딕'
+    title_format.size = Pt(18)
+    title_format.color.rgb = RGBColor(0, 0, 0)
+
+    # 생성 정보 추가
+    info_para = doc.add_paragraph()
+    info_para.add_run(f"생성일시: {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')}")
+    info_para.add_run(f"\n총 발언 구간: {len(segments_list)}개")
+
+    # 구분선
+    doc.add_paragraph("=" * 60)
+
+    # 세그먼트별 내용 추가
+    for i, segment in enumerate(segments_list, 1):
+        p = doc.add_paragraph()
+
+        # 시간 정보 (굵게, 파란색)
+        time_run = p.add_run(f"[{segment['start']} - {segment['end']}] ")
+        time_run.bold = True
+        time_run.font.color.rgb = RGBColor(0, 100, 200)
+        time_run.font.size = Pt(10)
+
+        # 내용 (일반 텍스트)
+        content_run = p.add_run(segment['text'])
+        content_run.font.name = '맑은 고딕'
+        content_run.font.size = Pt(11)
+
+        # 10개마다 구분선 추가
+        if i % 10 == 0 and i < len(segments_list):
+            doc.add_paragraph("-" * 40)
+
+    return doc
+
+# HWPX 회의록 생성 함수
+def create_enhanced_meeting_hwpx(segments_list):
+    log.info(f"=== HWPX 생성 시작 ===")
+    log.info(f"segments_list 길이: {len(segments_list)}")
+
+    try:
+        # HWPX 네임스페이스 등록 (한글 프로그램 호환성)
+        import xml.etree.ElementTree as ET
+        ET.register_namespace('hp', 'http://www.hancom.co.kr/hwpml/2011/paragraph')
+        ET.register_namespace('hs', 'http://www.hancom.co.kr/hwpml/2011/section')
+        ET.register_namespace('hh', 'http://www.hancom.co.kr/hwpml/2011/head')
+        ET.register_namespace('ha', 'http://www.hancom.co.kr/hwpml/2011/app')
+        ET.register_namespace('hc', 'http://www.hancom.co.kr/hwpml/2011/core')
+        ET.register_namespace('hhs', 'http://www.hancom.co.kr/hwpml/2011/history')
+        ET.register_namespace('hm', 'http://www.hancom.co.kr/hwpml/2011/master-page')
+        ET.register_namespace('hpf', 'http://www.hancom.co.kr/schema/2011/hpf')
+        ET.register_namespace('hp10', 'http://www.hancom.co.kr/hwpml/2016/paragraph')
+        ET.register_namespace('ooxmlchart', 'http://www.hancom.co.kr/hwpml/2016/ooxmlchart')
+        ET.register_namespace('hwpunitchar', 'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar')
+        ET.register_namespace('dc', 'http://purl.org/dc/elements/1.1/')
+        ET.register_namespace('opf', 'http://www.idpf.org/2007/opf/')
+        ET.register_namespace('epub', 'http://www.idpf.org/2007/ops')
+        ET.register_namespace('config', 'urn:oasis:names:tc:opendocument:xmlns:config:1.0')
+
+        # 빈 문서 바이트 확인
+        blank_bytes = blank_document_bytes()
+        log.info(f"blank_document_bytes 크기: {len(blank_bytes)} bytes")
+
+        doc = HwpxDocument.open(BytesIO(blank_bytes))
+        log.info(f"HwpxDocument 생성 완료: {doc}")
+        log.info(f"sections 수: {len(doc.sections)}")
+
+        if not doc.sections:
+            log.error("문서에 섹션이 없습니다!")
+            return doc
+
+        section = doc.sections[0]
+        log.info(f"section: {section}")
+
+        # 제목
+        title_p = doc.add_paragraph("회의록", section=section)
+        log.info(f"제목 추가 완료: {title_p}")
+
+        # 생성 정보
+        info_p = doc.add_paragraph(
+            f"생성일시: {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')}\n총 발언 구간: {len(segments_list)}개",
+            section=section
+        )
+        log.info(f"생성 정보 추가 완료")
+
+        # 구분선
+        doc.add_paragraph("=" * 60, section=section)
+        log.info(f"구분선 추가 완료")
+
+        # 세그먼트
+        for i, seg in enumerate(segments_list, 1):
+            p = doc.add_paragraph("", section=section)
+            p.add_run(f"[{seg['start']} - {seg['end']}] ", bold=True)  # 시간 강조
+            p.add_run(seg["text"])                                     # 본문
+
+            if i % 10 == 0 and i < len(segments_list):
+                doc.add_paragraph("-" * 40, section=section)
+
+        log.info(f"세그먼트 {len(segments_list)}개 추가 완료")
+        log.info(f"총 paragraphs 수: {len(doc.paragraphs)}")
+        log.info(f"=== HWPX 생성 완료 ===")
+
+        return doc
+
+    except Exception as e:
+        log.error(f"HWPX 생성 중 오류: {str(e)}")
+        import traceback
+        log.error(traceback.format_exc())
+        raise

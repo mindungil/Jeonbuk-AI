@@ -22,7 +22,6 @@ from fastapi import (
 )
 
 from fastapi.responses import FileResponse, StreamingResponse
-
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import SRC_LOG_LEVELS
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
@@ -35,19 +34,14 @@ from open_webui.models.files import (
     Files,
 )
 from open_webui.models.knowledge import Knowledges
-from open_webui.models.groups import Groups
-
 
 from open_webui.routers.knowledge import get_knowledge, get_knowledge_list
 from open_webui.routers.retrieval import ProcessFileForm, process_file
-from open_webui.routers.audio import transcribe
-
+from open_webui.routers.audio import transcribe_original
+from  open_webui.routers.audio import transcribe
+#from open_webui.routers.transcription import transcribe
 from open_webui.storage.provider import Storage
-
-
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.access_control import has_access
-
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
@@ -61,37 +55,31 @@ router = APIRouter()
 ############################
 
 
-# TODO: Optimize this function to use the knowledge_file table for faster lookups.
 def has_access_to_file(
     file_id: Optional[str], access_type: str, user=Depends(get_verified_user)
 ) -> bool:
     file = Files.get_file_by_id(file_id)
     log.debug(f"Checking if user has {access_type} access to file")
+
     if not file:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    knowledge_bases = Knowledges.get_knowledges_by_file_id(file_id)
-    user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
-
-    for knowledge_base in knowledge_bases:
-        if knowledge_base.user_id == user.id or has_access(
-            user.id, access_type, knowledge_base.access_control, user_group_ids
-        ):
-            return True
-
+    has_access = False
     knowledge_base_id = file.meta.get("collection_name") if file.meta else None
+
     if knowledge_base_id:
         knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
             user.id, access_type
         )
         for knowledge_base in knowledge_bases:
             if knowledge_base.id == knowledge_base_id:
-                return True
+                has_access = True
+                break
 
-    return False
+    return has_access
 
 
 ############################
@@ -99,7 +87,7 @@ def has_access_to_file(
 ############################
 
 
-def process_uploaded_file(request, file, file_path, file_item, file_metadata, user):
+def process_uploaded_file(request, file, file_path, file_item, file_metadata, user, filedata):
     try:
         if file.content_type:
             stt_supported_content_types = getattr(
@@ -116,7 +104,13 @@ def process_uploaded_file(request, file, file_path, file_item, file_metadata, us
                 )
             ):
                 file_path = Storage.get_file(file_path)
-                result = transcribe(request, file_path, file_metadata, user)
+                result = {}
+                if(file_metadata is None):
+                    log.info("file_metadata is None: 오리지널 버전 호출")
+                    result = transcribe_original(request, file_path, file_metadata)
+                else :
+                    log.info("file_metadata is not None: 회의록 버전 호출")
+                    result = transcribe(request, file_path, file_metadata, filedata)
 
                 process_file(
                     request,
@@ -216,6 +210,14 @@ def upload_file_handler(
         id = str(uuid.uuid4())
         name = filename
         filename = f"{id}_{filename}"
+        
+        tags ={
+                "OpenWebUI-User-Email": user.email,
+                "OpenWebUI-User-Id": user.id,
+                "OpenWebUI-User-Name": user.name,
+                "OpenWebUI-File-Id": id,
+        }
+        
         contents, file_path = Storage.upload_file(
             file.file,
             filename,
@@ -227,6 +229,8 @@ def upload_file_handler(
             },
         )
 
+        filedata = [id, name, filename, tags]
+        
         file_item = Files.insert_new_file(
             user.id,
             FileForm(
@@ -257,6 +261,7 @@ def upload_file_handler(
                     file_item,
                     file_metadata,
                     user,
+                    filedata,
                 )
                 return {"status": True, **file_item.model_dump()}
             else:
@@ -284,6 +289,7 @@ def upload_file_handler(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
         )
+
 
 
 ############################
@@ -570,7 +576,14 @@ async def get_file_content_by_id(
                 encoded_filename = quote(filename)
                 headers = {}
 
+                # txt처럼 끝나지만 .txt 확장자가 없는 경우 강제로 확장자 붙이기
+                if filename.lower().endswith("txt") and not filename.lower().endswith(".txt"):
+                    filename += ".txt"
+                encoded_filename = quote(filename)
+
+
                 if attachment:
+                    
                     headers["Content-Disposition"] = (
                         f"attachment; filename*=UTF-8''{encoded_filename}"
                     )

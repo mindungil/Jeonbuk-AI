@@ -81,6 +81,11 @@
 	import Knobs from '../icons/Knobs.svelte';
 	import ValvesModal from '../workspace/common/ValvesModal.svelte';
 
+	// STT 회의록용 컴포넌트 
+	import AudioFileLinks from './MessageInput/AudioFileLinks.svelte';
+
+
+
 	const i18n = getContext('i18n');
 
 	export let onChange: Function = () => {};
@@ -1174,6 +1179,7 @@
 													console.log(file);
 												}}
 											/>
+											<AudioFileLinks {file} />
 										{/if}
 									{/each}
 								</div>

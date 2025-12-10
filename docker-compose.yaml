@@ -5,10 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: webui
     environment:
-      - DATABASE_URL=postgresql://admin:wjsqnrai@220.124.155.35:5432/customui
+      - DATABASE_URL=postgresql://admin:wjsqnrai@210.95.219.230:5432/customui
       - CORS_ALLOW_ORIGIN=https://ai.jb.go.kr;http://ai.jb.go.kr
-      - OCR_SERVER_URL=http://220.124.155.35:30100
-      - NEWS_API_URL=http://220.124.155.35:5004/news
+      - OCR_SERVER_URL=http://210.95.219.230:30100
+      - NEWS_API_URL=http://news-service:5004/news
     volumes:
       - open-webui:/app/backend/data
     expose:
@@ -38,4 +38,5 @@ volumes:
 
 networks:
   customui:
-    driver: bridge
+    external: 
+      name: jeonbuk-ai_customui
